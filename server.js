@@ -9,10 +9,6 @@ const { Pool } = pg;
 const app = express();
 app.use(cors());
 app.use(express.json());
-app.post('/api/wallet/init', async (req, res) => {
-  const { telegramId, referrerId } = req.body;
-  console.log(`📥 Вхід користувача: ID=${telegramId}, Referrer=${referrerId}`);
-  // ... далі весь код
 
 const PORT = process.env.PORT || 3000;
 const connection = new Connection(clusterApiUrl('mainnet-beta'), 'confirmed');
@@ -101,18 +97,20 @@ const WHALE_DATABASE = [
 
 let latestTokens = [];
 
-// 1. Ініціалізація або прив'язка реферала
+// 1. Ініціалізація та прив'язка реферала з логуванням
 app.post('/api/wallet/init', async (req, res) => {
   const { telegramId, referrerId } = req.body;
+  console.log(`📥 [LOG] Вхід користувача: ID=${telegramId}, Referrer=${referrerId}`);
+
   if (!telegramId) return res.status(400).json({ error: "telegramId is required" });
 
   try {
     const existing = await pool.query('SELECT public_key, auto_copy, referrer_id FROM users WHERE telegram_id = $1', [String(telegramId)]);
     
     if (existing.rows.length > 0) {
-      // Якщо реферера ще не було записано, але юзер перейшов по рефці — прив'язуємо
       if (!existing.rows[0].referrer_id && referrerId && String(referrerId) !== String(telegramId)) {
         await pool.query('UPDATE users SET referrer_id = $1 WHERE telegram_id = $2', [String(referrerId), String(telegramId)]);
+        console.log(`🔗 [LOG] Реферер ${referrerId} успішно прив'язаний до користувача ${telegramId}`);
       }
       return res.json({
         publicKey: existing.rows[0].public_key,
@@ -131,12 +129,17 @@ app.post('/api/wallet/init', async (req, res) => {
       [String(telegramId), pubkey, secret, true, ref]
     );
 
+    if (ref) {
+      console.log(`🎉 [LOG] Новий користувач ${telegramId} зареєстрований за реф-посиланням від ${ref}`);
+    }
+
     res.json({
       publicKey: pubkey,
       feeTier: "Standard (1% fee)",
       autoCopyEnabled: true
     });
   } catch (err) {
+    console.error("Помилка /api/wallet/init:", err.message);
     res.status(500).json({ error: err.message });
   }
 });
