@@ -12,7 +12,7 @@ const PORT = process.env.PORT || 3000;
 const connection = new Connection(clusterApiUrl('mainnet-beta'), 'confirmed');
 
 // ТВІЙ ГАМАНЕЦЬ ДЛЯ ЗБОРУ КОМІСІЙ (можеш замінити на свій реальний публічний ключ Solana)
-const FEE_RECIPIENT_WALLET = "ENTER_YOUR_SOLANA_WALLET_ADDRESS_HERE";
+const FEE_RECIPIENT_WALLET = "EiiXRmMt41GCBKdsodHHk8DLM8E32QmqQHp7Fv5pzXLs";
 const FEE_PERCENT = 0.01; // 1% комісії платформи
 
 // In-memory збереження ключів
