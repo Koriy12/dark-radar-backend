@@ -13,18 +13,18 @@ app.use(express.json());
 const PORT = process.env.PORT || 3000;
 const connection = new Connection(clusterApiUrl('mainnet-beta'), 'confirmed');
 
-// Твой кошелек для сбора 1% комиссии
+// Особистий гаманець для збору 1% комісії
 const FEE_RECIPIENT_WALLET = "EiiXRmMt41GCBKdsodHHk8DLM8E32QmqQHp7Fv5pzXLs";
 const PLATFORM_FEE_PERCENT = 0.01;
 const REFERRAL_SHARE_PERCENT = 0.25;
 
-// Подключение к Postgres
+// Підключення до бази PostgreSQL
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
   ssl: process.env.DATABASE_URL ? { rejectUnauthorized: false } : false
 });
 
-// Автоматическая миграция структуры базы данных
+// Автоматична міграція структури бази даних
 async function initDB() {
   try {
     await pool.query(`
@@ -37,7 +37,6 @@ async function initDB() {
       );
     `);
 
-    // Добавляем новые колонки в существующую таблицу, если их нет
     await pool.query(`
       ALTER TABLE users ADD COLUMN IF NOT EXISTS referrer_id VARCHAR(64);
       ALTER TABLE users ADD COLUMN IF NOT EXISTS volume_sol NUMERIC DEFAULT 0;
@@ -46,9 +45,9 @@ async function initDB() {
       ALTER TABLE users ADD COLUMN IF NOT EXISTS winrate INT DEFAULT 75;
     `);
 
-    console.log("✅ База данных Postgres успешно обновлена и готова к работе");
+    console.log("✅ База даних Postgres успішно перевірена та готова");
   } catch (err) {
-    console.error("❌ Ошибка инициализации БД:", err.message);
+    console.error("❌ Помилка БД:", err.message);
   }
 }
 initDB();
@@ -98,14 +97,19 @@ const WHALE_DATABASE = [
 
 let latestTokens = [];
 
-// 1. Инициализация кошелька пользователя
+// 1. Ініціалізація або прив'язка реферала
 app.post('/api/wallet/init', async (req, res) => {
   const { telegramId, referrerId } = req.body;
   if (!telegramId) return res.status(400).json({ error: "telegramId is required" });
 
   try {
-    const existing = await pool.query('SELECT public_key, auto_copy FROM users WHERE telegram_id = $1', [String(telegramId)]);
+    const existing = await pool.query('SELECT public_key, auto_copy, referrer_id FROM users WHERE telegram_id = $1', [String(telegramId)]);
+    
     if (existing.rows.length > 0) {
+      // Якщо реферера ще не було записано, але юзер перейшов по рефці — прив'язуємо
+      if (!existing.rows[0].referrer_id && referrerId && String(referrerId) !== String(telegramId)) {
+        await pool.query('UPDATE users SET referrer_id = $1 WHERE telegram_id = $2', [String(referrerId), String(telegramId)]);
+      }
       return res.json({
         publicKey: existing.rows[0].public_key,
         feeTier: "Standard (1% fee)",
@@ -144,12 +148,12 @@ app.get('/api/wallet/balance/:pubkey', async (req, res) => {
   }
 });
 
-// 3. Вывод средств (Withdraw)
+// 3. Виведення коштів (Withdraw)
 app.post('/api/wallet/withdraw', async (req, res) => {
   const { telegramId, targetAddress, amountSol } = req.body;
   try {
     const userRes = await pool.query('SELECT secret_key, public_key FROM users WHERE telegram_id = $1', [String(telegramId)]);
-    if (userRes.rows.length === 0) return res.status(404).json({ error: "Пользователь не найден" });
+    if (userRes.rows.length === 0) return res.status(404).json({ error: "Користувача не знайдено" });
 
     const keypair = Keypair.fromSecretKey(bs58.decode(userRes.rows[0].secret_key));
     const lamports = Math.floor(parseFloat(amountSol) * LAMPORTS_PER_SOL);
@@ -169,17 +173,17 @@ app.post('/api/wallet/withdraw', async (req, res) => {
   }
 });
 
-// 4. Список китов
+// 4. Список китів
 app.get('/api/whales', (req, res) => {
   res.json(WHALE_DATABASE);
 });
 
-// 5. Поток токенов для AI Радара
+// 5. Потік токенів Pump.fun
 app.get('/api/radar/latest', (req, res) => {
   res.json(latestTokens);
 });
 
-// 6. Реферальная статистика
+// 6. Реферальна статистика
 app.get('/api/referrals/:telegramId', async (req, res) => {
   const { telegramId } = req.params;
   try {
@@ -194,14 +198,14 @@ app.get('/api/referrals/:telegramId', async (req, res) => {
     res.json({
       referralsCount: count,
       totalEarnedSol: rewards,
-      refLink: `https://t.me/darksolradar_bot?start=ref_${telegramId}`
+      refLink: `https://t.me/darksolradar_bot?startapp=ref_${telegramId}`
     });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
 });
 
-// 7. Лидерборд
+// 7. Лідерборд трейдерів
 app.get('/api/leaderboard', async (req, res) => {
   try {
     const result = await pool.query(`
@@ -228,12 +232,12 @@ app.get('/api/leaderboard', async (req, res) => {
   }
 });
 
-// 8. Торговля через PumpPortal
+// 8. Торгівля через PumpPortal з нарахуванням 25% рефбеку
 app.post('/api/trade/pump', async (req, res) => {
   const { telegramId, mint, action, amountSol } = req.body;
   try {
     const userRes = await pool.query('SELECT secret_key, public_key, referrer_id FROM users WHERE telegram_id = $1', [String(telegramId)]);
-    if (userRes.rows.length === 0) return res.status(404).json({ error: "Кошелек не найден" });
+    if (userRes.rows.length === 0) return res.status(404).json({ error: "Гаманець не знайдено" });
 
     const wallet = userRes.rows[0];
     const totalAmount = parseFloat(amountSol);
@@ -295,33 +299,52 @@ app.post('/api/trade/pump', async (req, res) => {
   }
 });
 
-// 9. Мониторинг китов
+// 9. Додавання кастомного кита
+app.post('/api/whales/custom', async (req, res) => {
+  const { address, name } = req.body;
+  if (!address || address.length < 32) {
+    return res.status(400).json({ error: "Некоректна адреса Solana" });
+  }
+
+  const whaleItem = {
+    id: Date.now(),
+    name: name || `Custom Whale (${address.slice(0, 4)}...)`,
+    address: address,
+    winrate: 78,
+    pnl7d: "+50 SOL",
+    isCopied: true
+  };
+
+  WHALE_DATABASE.push(whaleItem);
+  res.json({ success: true, whale: whaleItem });
+});
+
+// 10. Моніторинг китів через WebSocket RPC
 function trackWhaleWallets() {
-  console.log("👀 Запуск ончейн-радара сделок китов...");
+  console.log("👀 Запуск ончейн-радара угод китів...");
   WHALE_DATABASE.forEach(whale => {
     try {
       const pubkey = new PublicKey(whale.address);
       connection.onLogs(
         pubkey,
-        async (logs) => {
-          if (logs.err) return;
-          console.log(`🚨 Кит [${whale.name}] совершил действие! Сигнатура: ${logs.signature}`);
+        (logs) => {
+          if (!logs.err) {
+            console.log(`🚨 Кит [${whale.name}] зробив дію!`);
+          }
         },
         "confirmed"
       );
-    } catch (e) {
-      console.error(`Ошибка подписки на адрес ${whale.address}:`, e.message);
-    }
+    } catch (e) {}
   });
 }
 trackWhaleWallets();
 
-// 10. WebSocket ствол Pump.fun
+// 11. WebSocket стрім Pump.fun
 function listenPumpFun() {
   const ws = new WebSocket('wss://pumpportal.fun/api/data');
   ws.on('open', () => {
     ws.send(JSON.stringify({ method: "subscribeNewToken" }));
-    console.log("⚡ Подключено к PumpPortal Live Feed");
+    console.log("⚡ Підключено до PumpPortal Live Feed");
   });
 
   ws.on('message', (data) => {
@@ -333,7 +356,7 @@ function listenPumpFun() {
           name: parsed.name,
           symbol: parsed.symbol || "MEME",
           initialBuy: parsed.initialBuy ? (parsed.initialBuy / LAMPORTS_PER_SOL).toFixed(2) : "0.5",
-          time: new Date().toLocaleTimeString('ru-RU', { hour: '2-digit', minute: '2-digit', second: '2-digit' }),
+          time: new Date().toLocaleTimeString('uk-UA', { hour: '2-digit', minute: '2-digit', second: '2-digit' }),
           aiScore: Math.floor(Math.random() * (98 - 82 + 1)) + 82
         };
 
@@ -351,5 +374,5 @@ function listenPumpFun() {
 listenPumpFun();
 
 app.listen(PORT, () => {
-  console.log(`🚀 Сервер Dark Sol Radar работает на порту ${PORT}`);
+  console.log(`🚀 Сервер Dark Sol Radar працює на порту ${PORT}`);
 });
