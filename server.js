@@ -9,6 +9,10 @@ const { Pool } = pg;
 const app = express();
 app.use(cors());
 app.use(express.json());
+app.post('/api/wallet/init', async (req, res) => {
+  const { telegramId, referrerId } = req.body;
+  console.log(`📥 Вхід користувача: ID=${telegramId}, Referrer=${referrerId}`);
+  // ... далі весь код
 
 const PORT = process.env.PORT || 3000;
 const connection = new Connection(clusterApiUrl('mainnet-beta'), 'confirmed');
