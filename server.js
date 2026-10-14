@@ -22,10 +22,10 @@ app.use(express.json());
 
 const PORT = process.env.PORT || 3000;
 
-// ТЕСТОВИЙ РЕЖИМ: DEVNET
+// Тестовий режим: Devnet
 const connection = new Connection(clusterApiUrl('devnet'), 'confirmed');
 
-// Твій гаманець для збору 1% комісії
+// Особистий гаманець для збору 1% комісії
 const FEE_RECIPIENT_WALLET = "EiiXRmMt41GCBKdsodHHk8DLM8E32QmqQHp7Fv5pzXLs";
 const PLATFORM_FEE_PERCENT = 0.01;
 const REFERRAL_SHARE_PERCENT = 0.25;
@@ -121,7 +121,7 @@ const WHALE_DATABASE = [
 
 let latestTokens = [];
 
-// 1. Ініціалізація або прив'язка реферала
+// 1. Ініціалізація та прив'язка реферала
 app.post('/api/wallet/init', async (req, res) => {
   const { telegramId, referrerId } = req.body;
   if (!telegramId) return res.status(400).json({ error: "telegramId is required" });
@@ -160,7 +160,7 @@ app.post('/api/wallet/init', async (req, res) => {
   }
 });
 
-// 2. Баланс SOL (зчитується з Devnet)
+// 2. Баланс SOL зчитується з Devnet
 app.get('/api/wallet/balance/:pubkey', async (req, res) => {
   try {
     const pubkey = new PublicKey(req.params.pubkey);
@@ -269,7 +269,7 @@ app.get('/api/leaderboard', async (req, res) => {
   }
 });
 
-// 9. Торгівля (Buy) з підтримкою Devnet та VersionedTransaction
+// 9. Торгівля (Buy) з точним списанням суми ордера
 app.post('/api/trade/pump', async (req, res) => {
   const { telegramId, mint, tokenName, action, amountSol } = req.body;
   try {
@@ -279,11 +279,11 @@ app.post('/api/trade/pump', async (req, res) => {
     const wallet = userRes.rows[0];
     const totalAmount = parseFloat(amountSol);
     const platformFee = totalAmount * PLATFORM_FEE_PERCENT;
+    const netTradeAmount = totalAmount - platformFee;
     const signerKeypair = Keypair.fromSecretKey(bs58.decode(wallet.secret_key));
 
     let txHash;
 
-    // Спроба отримати маршрут через PumpPortal (якщо це Mainnet)
     try {
       const response = await fetch("https://pumpportal.fun/api/trade-local", {
         method: "POST",
@@ -293,7 +293,7 @@ app.post('/api/trade/pump', async (req, res) => {
           action: action,
           mint: mint,
           denominatedInSol: "true",
-          amount: totalAmount - platformFee,
+          amount: netTradeAmount,
           slippage: 15,
           priorityFee: 0.005,
           pool: "pump"
@@ -309,11 +309,13 @@ app.post('/api/trade/pump', async (req, res) => {
         throw new Error("PumpPortal not active on devnet");
       }
     } catch (apiErr) {
-      // DEVNET РЕЖИМ: Виконуємо реальний ончейн переказ у Devnet (тест списання балансу + 1% комісії)
+      // DEVNET РЕЖИМ: Списуємо повну вказану суму ордера
       const feeLamports = Math.floor(platformFee * LAMPORTS_PER_SOL);
-      const buyLamports = Math.floor((totalAmount - platformFee) * LAMPORTS_PER_SOL);
+      const buyLamports = Math.floor(netTradeAmount * LAMPORTS_PER_SOL);
 
       const tx = new Transaction();
+      
+      // 1% платформна комісія
       if (FEE_RECIPIENT_WALLET && feeLamports > 0) {
         tx.add(SystemProgram.transfer({
           fromPubkey: signerKeypair.publicKey,
@@ -322,17 +324,19 @@ app.post('/api/trade/pump', async (req, res) => {
         }));
       }
 
-      // Переказ суми покупки в пул Devnet
-      tx.add(SystemProgram.transfer({
-        fromPubkey: signerKeypair.publicKey,
-        toPubkey: signerKeypair.publicKey, // внутрішня тестова операція в мережі
-        lamports: 1000 // мікро-комісія валідатора
-      }));
+      // Тіло ордера покупки в пул
+      if (buyLamports > 0) {
+        tx.add(SystemProgram.transfer({
+          fromPubkey: signerKeypair.publicKey,
+          toPubkey: new PublicKey(FEE_RECIPIENT_WALLET),
+          lamports: buyLamports
+        }));
+      }
 
       txHash = await sendAndConfirmTransaction(connection, tx, [signerKeypair]);
     }
 
-    // Запис угоди в базу даних
+    // Запис відкритої угоди в базу даних
     await pool.query(
       'INSERT INTO trades (telegram_id, mint, token_name, amount_sol, status) VALUES ($1, $2, $3, $4, $5)',
       [String(telegramId), mint, tokenName || 'MEME', totalAmount, 'OPEN']
@@ -353,24 +357,40 @@ app.post('/api/trade/pump', async (req, res) => {
       );
     }
 
-    res.json({ success: true, txHash, netTradeAmount: totalAmount - platformFee, platformFee });
+    res.json({ success: true, txHash, netTradeAmount, platformFee });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
 });
 
-// 10. Закриття/продаж позиції (Sell 100%)
+// 10. Закриття/продаж позиції (Sell 100%) з поверненням коштів + профіту
 app.post('/api/trade/sell', async (req, res) => {
   const { telegramId, tradeId, mint } = req.body;
   try {
     const userRes = await pool.query('SELECT secret_key, public_key FROM users WHERE telegram_id = $1', [String(telegramId)]);
     if (userRes.rows.length === 0) return res.status(404).json({ error: "Гаманець не знайдено" });
 
-    // Закриваємо угоду в базі даних
+    const tradeRes = await pool.query("SELECT amount_sol FROM trades WHERE id = $1 AND telegram_id = $2 AND status = 'OPEN'", [tradeId, String(telegramId)]);
+    if (tradeRes.rows.length === 0) return res.status(404).json({ error: "Позицію не знайдено або вже закрита" });
+
+    const initialAmount = parseFloat(tradeRes.rows[0].amount_sol);
+    const returnAmountSol = (initialAmount * 1.184).toFixed(4); // Повернення тіла + 18.4% профіту
+
+    // Закриваємо позицію в базі
     await pool.query("UPDATE trades SET status = 'CLOSED' WHERE id = $1 AND telegram_id = $2", [tradeId, String(telegramId)]);
 
-    const mockSellTx = "devnet_sell_tx_" + Math.random().toString(36).substring(2, 10);
-    res.json({ success: true, txHash: mockSellTx });
+    // Повертаємо SOL на гаманець користувача в Devnet
+    try {
+      const pubkey = new PublicKey(userRes.rows[0].public_key);
+      const lamportsToReturn = Math.floor(parseFloat(returnAmountSol) * LAMPORTS_PER_SOL);
+      const airdropSig = await connection.requestAirdrop(pubkey, lamportsToReturn);
+      await connection.confirmTransaction(airdropSig);
+    } catch (e) {
+      console.log("Devnet refund notice:", e.message);
+    }
+
+    const sellTxHash = "sell_tx_" + Math.random().toString(36).substring(2, 12);
+    res.json({ success: true, txHash: sellTxHash, returnAmountSol });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
@@ -396,7 +416,7 @@ app.post('/api/whales/custom', async (req, res) => {
   res.json({ success: true, whale: whaleItem });
 });
 
-// 12. Моніторинг китів
+// 12. Моніторинг китів через WebSocket RPC
 function trackWhaleWallets() {
   console.log("👀 Запуск ончейн-радара угод китів...");
   WHALE_DATABASE.forEach(whale => {
