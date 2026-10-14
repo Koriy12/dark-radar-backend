@@ -11,7 +11,8 @@ app.use(cors());
 app.use(express.json());
 
 const PORT = process.env.PORT || 3000;
-const connection = new Connection(clusterApiUrl('mainnet-beta'), 'confirmed');
+// Замість 'mainnet-beta' встановлюємо 'devnet'
+const connection = new Connection(clusterApiUrl('devnet'), 'confirmed');
 
 // Особистий гаманець для збору 1% комісії
 const FEE_RECIPIENT_WALLET = "EiiXRmMt41GCBKdsodHHk8DLM8E32QmqQHp7Fv5pzXLs";
