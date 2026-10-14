@@ -24,7 +24,7 @@ const pool = new Pool({
   ssl: process.env.DATABASE_URL ? { rejectUnauthorized: false } : false
 });
 
-// Автоматична міграція структури бази даних
+// Автоматична міграція структури бази даних (users + trades)
 async function initDB() {
   try {
     await pool.query(`
@@ -45,7 +45,21 @@ async function initDB() {
       ALTER TABLE users ADD COLUMN IF NOT EXISTS winrate INT DEFAULT 75;
     `);
 
-    console.log("✅ База даних Postgres успішно перевірена та готова");
+    // Таблиця відкритих та закритих позицій трейдера
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS trades (
+        id SERIAL PRIMARY KEY,
+        telegram_id VARCHAR(64) NOT NULL,
+        mint VARCHAR(64) NOT NULL,
+        token_name VARCHAR(128) DEFAULT 'MEME',
+        amount_sol NUMERIC NOT NULL,
+        entry_price NUMERIC DEFAULT 1,
+        status VARCHAR(16) DEFAULT 'OPEN',
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+      );
+    `);
+
+    console.log("✅ База даних Postgres успішно перевірена (users + trades)");
   } catch (err) {
     console.error("❌ Помилка БД:", err.message);
   }
@@ -97,11 +111,9 @@ const WHALE_DATABASE = [
 
 let latestTokens = [];
 
-// 1. Ініціалізація та прив'язка реферала з логуванням
+// 1. Ініціалізація та прив'язка реферала
 app.post('/api/wallet/init', async (req, res) => {
   const { telegramId, referrerId } = req.body;
-  console.log(`📥 [LOG] Вхід користувача: ID=${telegramId}, Referrer=${referrerId}`);
-
   if (!telegramId) return res.status(400).json({ error: "telegramId is required" });
 
   try {
@@ -110,7 +122,6 @@ app.post('/api/wallet/init', async (req, res) => {
     if (existing.rows.length > 0) {
       if (!existing.rows[0].referrer_id && referrerId && String(referrerId) !== String(telegramId)) {
         await pool.query('UPDATE users SET referrer_id = $1 WHERE telegram_id = $2', [String(referrerId), String(telegramId)]);
-        console.log(`🔗 [LOG] Реферер ${referrerId} успішно прив'язаний до користувача ${telegramId}`);
       }
       return res.json({
         publicKey: existing.rows[0].public_key,
@@ -129,17 +140,12 @@ app.post('/api/wallet/init', async (req, res) => {
       [String(telegramId), pubkey, secret, true, ref]
     );
 
-    if (ref) {
-      console.log(`🎉 [LOG] Новий користувач ${telegramId} зареєстрований за реф-посиланням від ${ref}`);
-    }
-
     res.json({
       publicKey: pubkey,
       feeTier: "Standard (1% fee)",
       autoCopyEnabled: true
     });
   } catch (err) {
-    console.error("Помилка /api/wallet/init:", err.message);
     res.status(500).json({ error: err.message });
   }
 });
@@ -180,17 +186,31 @@ app.post('/api/wallet/withdraw', async (req, res) => {
   }
 });
 
-// 4. Список китів
+// 4. Отримання портфеля користувача
+app.get('/api/portfolio/:telegramId', async (req, res) => {
+  const { telegramId } = req.params;
+  try {
+    const tradesRes = await pool.query(
+      "SELECT id, mint, token_name, amount_sol, created_at FROM trades WHERE telegram_id = $1 AND status = 'OPEN' ORDER BY id DESC",
+      [String(telegramId)]
+    );
+    res.json(tradesRes.rows);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// 5. Список китів
 app.get('/api/whales', (req, res) => {
   res.json(WHALE_DATABASE);
 });
 
-// 5. Потік токенів Pump.fun
+// 6. Потік токенів Pump.fun
 app.get('/api/radar/latest', (req, res) => {
   res.json(latestTokens);
 });
 
-// 6. Реферальна статистика
+// 7. Реферальна статистика
 app.get('/api/referrals/:telegramId', async (req, res) => {
   const { telegramId } = req.params;
   try {
@@ -205,14 +225,14 @@ app.get('/api/referrals/:telegramId', async (req, res) => {
     res.json({
       referralsCount: count,
       totalEarnedSol: rewards,
-      refLink: `https://t.me/darksolradar_bot?startapp=ref_${telegramId}`
+      refLink: `https://t.me/darksolradar_bot/app?startapp=ref_${telegramId}`
     });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
 });
 
-// 7. Лідерборд трейдерів
+// 8. Лідерборд трейдерів
 app.get('/api/leaderboard', async (req, res) => {
   try {
     const result = await pool.query(`
@@ -239,9 +259,9 @@ app.get('/api/leaderboard', async (req, res) => {
   }
 });
 
-// 8. Торгівля через PumpPortal з нарахуванням 25% рефбеку
+// 9. Торгівля (Buy) з фіксацією угоди в портфелі
 app.post('/api/trade/pump', async (req, res) => {
-  const { telegramId, mint, action, amountSol } = req.body;
+  const { telegramId, mint, tokenName, action, amountSol } = req.body;
   try {
     const userRes = await pool.query('SELECT secret_key, public_key, referrer_id FROM users WHERE telegram_id = $1', [String(telegramId)]);
     if (userRes.rows.length === 0) return res.status(404).json({ error: "Гаманець не знайдено" });
@@ -283,11 +303,19 @@ app.post('/api/trade/pump', async (req, res) => {
 
       const txHash = await connection.sendRawTransaction(tx.serialize());
 
+      // Записуємо позицію у портфель
       await pool.query(
-        'UPDATE users SET volume_sol = COALESCE(volume_sol, 0) + $1, pnl_sol = COALESCE(pnl_sol, 0) + $2 WHERE telegram_id = $3',
-        [totalAmount, (totalAmount * 0.4).toFixed(3), String(telegramId)]
+        'INSERT INTO trades (telegram_id, mint, token_name, amount_sol, status) VALUES ($1, $2, $3, $4, $5)',
+        [String(telegramId), mint, tokenName || 'MEME', totalAmount, 'OPEN']
       );
 
+      // Оновлюємо торговий обсяг
+      await pool.query(
+        'UPDATE users SET volume_sol = COALESCE(volume_sol, 0) + $1, pnl_sol = COALESCE(pnl_sol, 0) + $2 WHERE telegram_id = $3',
+        [totalAmount, (totalAmount * 0.35).toFixed(3), String(telegramId)]
+      );
+
+      // Нараховуємо 25% рефбеку рефереру
       if (wallet.referrer_id) {
         const refReward = platformFee * REFERRAL_SHARE_PERCENT;
         await pool.query(
@@ -306,7 +334,51 @@ app.post('/api/trade/pump', async (req, res) => {
   }
 });
 
-// 9. Додавання кастомного кита
+// 10. Закриття/продаж позиції (Sell 100%)
+app.post('/api/trade/sell', async (req, res) => {
+  const { telegramId, tradeId, mint } = req.body;
+  try {
+    const userRes = await pool.query('SELECT secret_key, public_key FROM users WHERE telegram_id = $1', [String(telegramId)]);
+    if (userRes.rows.length === 0) return res.status(404).json({ error: "Гаманець не знайдено" });
+
+    const wallet = userRes.rows[0];
+
+    const response = await fetch("https://pumpportal.fun/api/trade-local", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        publicKey: wallet.public_key,
+        action: "sell",
+        mint: mint,
+        denominatedInSol: "false",
+        amount: "100%",
+        slippage: 15,
+        priorityFee: 0.005,
+        pool: "pump"
+      })
+    });
+
+    if (response.status === 200) {
+      const txData = await response.arrayBuffer();
+      const tx = Transaction.from(Buffer.from(txData));
+      const signerKeypair = Keypair.fromSecretKey(bs58.decode(wallet.secret_key));
+      tx.sign(signerKeypair);
+      const txHash = await connection.sendRawTransaction(tx.serialize());
+
+      // Позначаємо угоду закритою
+      await pool.query("UPDATE trades SET status = 'CLOSED' WHERE id = $1 AND telegram_id = $2", [tradeId, String(telegramId)]);
+
+      res.json({ success: true, txHash });
+    } else {
+      const err = await response.text();
+      res.status(400).json({ error: err });
+    }
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// 11. Додавання кастомного кита
 app.post('/api/whales/custom', async (req, res) => {
   const { address, name } = req.body;
   if (!address || address.length < 32) {
@@ -326,7 +398,7 @@ app.post('/api/whales/custom', async (req, res) => {
   res.json({ success: true, whale: whaleItem });
 });
 
-// 10. Моніторинг китів через WebSocket RPC
+// 12. Моніторинг китів через WebSocket RPC
 function trackWhaleWallets() {
   console.log("👀 Запуск ончейн-радара угод китів...");
   WHALE_DATABASE.forEach(whale => {
@@ -346,7 +418,7 @@ function trackWhaleWallets() {
 }
 trackWhaleWallets();
 
-// 11. WebSocket стрім Pump.fun
+// 13. WebSocket стрім Pump.fun
 function listenPumpFun() {
   const ws = new WebSocket('wss://pumpportal.fun/api/data');
   ws.on('open', () => {
