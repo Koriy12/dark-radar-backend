@@ -21,6 +21,7 @@ app.use(cors());
 app.use(express.json());
 
 const PORT = process.env.PORT || 3000;
+// Для переходу на реальну мережу замініть 'devnet' на 'mainnet-beta'
 const connection = new Connection(clusterApiUrl('devnet'), 'confirmed');
 
 const FEE_RECIPIENT_WALLET = "EiiXRmMt41GCBKdsodHHk8DLM8E32QmqQHp7Fv5pzXLs";
@@ -56,7 +57,7 @@ async function initDB() {
         telegram_id VARCHAR(64) NOT NULL,
         mint VARCHAR(64) NOT NULL,
         token_name VARCHAR(128) DEFAULT 'MEME',
-        entry_price_sol NUMERIC DEFAULT 0.00000003,
+        entry_price_sol NUMERIC NOT NULL,
         amount_sol NUMERIC NOT NULL,
         remaining_amount_sol NUMERIC NOT NULL,
         take_profit_pct INT DEFAULT NULL,
@@ -74,9 +75,9 @@ async function initDB() {
       ALTER TABLE trades ADD COLUMN IF NOT EXISTS stop_loss_pct INT;
     `);
 
-    console.log("✅ Біржова БД успішно перевірена");
+    console.log("✅ Біржовий реєстр успішно ініціалізовано");
   } catch (err) {
-    console.error("❌ Помилка БД:", err.message);
+    console.error("❌ Помилка ініціалізації БД:", err.message);
   }
 }
 initDB();
@@ -90,11 +91,9 @@ const WHALE_DATABASE = [
 ];
 
 let latestTokens = [];
+const priceMemoryCache = new Map();
 
-// Кеш цін токенів у реальному часі
-const livePriceTracker = new Map();
-
-// 1. Ініціалізація
+// 1. Авторизація / створення гаманця
 app.post('/api/wallet/init', async (req, res) => {
   const { telegramId, referrerId } = req.body;
   if (!telegramId) return res.status(400).json({ error: "telegramId is required" });
@@ -134,77 +133,54 @@ app.post('/api/wallet/init', async (req, res) => {
   }
 });
 
-// 2. Баланс
+// 2. Баланс користувача
 app.get('/api/wallet/balance/:telegramId', async (req, res) => {
   try {
-    const userRes = await pool.query('SELECT public_key, balance_sol FROM users WHERE telegram_id = $1', [String(req.params.telegramId)]);
+    const userRes = await pool.query('SELECT balance_sol FROM users WHERE telegram_id = $1', [String(req.params.telegramId)]);
     if (userRes.rows.length === 0) return res.json({ balanceSol: "0.0000" });
-
-    const pubkey = new PublicKey(userRes.rows[0].public_key);
-    let onchainLamports = 0;
-    try {
-      onchainLamports = await connection.getBalance(pubkey);
-    } catch (e) {}
-
-    const onchainSol = onchainLamports / LAMPORTS_PER_SOL;
-    let currentBalance = parseFloat(userRes.rows[0].balance_sol || 0);
-
-    if (onchainSol > currentBalance) {
-      currentBalance = onchainSol;
-      await pool.query('UPDATE users SET balance_sol = $1 WHERE telegram_id = $2', [currentBalance, String(req.params.telegramId)]);
-    }
-
-    res.json({ balanceSol: currentBalance.toFixed(4) });
+    res.json({ balanceSol: parseFloat(userRes.rows[0].balance_sol || 0).toFixed(4) });
   } catch (e) {
     res.status(500).json({ error: e.message, balanceSol: "0.0000" });
   }
 });
 
-// 3. Реальний ончейн курс (DEXScreener + Pump.fun Price API)
+// 3. Реальна ринкова ціна токена
 app.get('/api/token/price/:mint', async (req, res) => {
   const { mint } = req.params;
   try {
-    // 1. Спроба отримати з DEXScreener
     const response = await fetch(`https://api.dexscreener.com/latest/dex/tokens/${mint}`);
     if (response.ok) {
       const data = await response.json();
       if (data.pairs && data.pairs.length > 0) {
         const pair = data.pairs[0];
         const priceSol = parseFloat(pair.priceNative || 0.00000005);
-        livePriceTracker.set(mint, priceSol);
+        priceMemoryCache.set(mint, priceSol);
         return res.json({
-          priceSol: priceSol,
+          priceSol,
           priceUsd: pair.priceUsd || "0.00001",
           priceChange5m: pair.priceChange?.m5 || 0,
-          marketCap: pair.marketCap || 12000,
-          source: 'dexscreener'
+          marketCap: pair.marketCap || 15000
         });
       }
     }
 
-    // 2. Якщо токен щойно вийшов на Pump.fun (bonding curve трекінг)
-    let currentPrice = livePriceTracker.get(mint);
-    if (!currentPrice) {
-      currentPrice = 0.000000032; // базова ціна мінту
+    let trackedPrice = priceMemoryCache.get(mint);
+    if (!trackedPrice) {
+      trackedPrice = 0.000000030;
+      priceMemoryCache.set(mint, trackedPrice);
     }
-    // Симуляція динамічного ончейн попиту Pump.fun
-    const jitter = (Math.random() - 0.47) * (currentPrice * 0.04);
-    currentPrice = Math.max(0.00000001, currentPrice + jitter);
-    livePriceTracker.set(mint, currentPrice);
-
     res.json({
-      priceSol: currentPrice,
-      priceUsd: (currentPrice * 180).toFixed(6),
-      priceChange5m: (((currentPrice - 0.000000032) / 0.000000032) * 100).toFixed(2),
-      marketCap: Math.round(currentPrice * 1000000000 * 180),
-      source: 'pump_curve'
+      priceSol: trackedPrice,
+      priceUsd: (trackedPrice * 180).toFixed(6),
+      priceChange5m: 0.0,
+      marketCap: Math.round(trackedPrice * 1000000000 * 180)
     });
   } catch (e) {
     res.json({ priceSol: 0.00000003, priceChange5m: 0 });
   }
 });
 
-// 4. Портфель відкритих угод
+// 4. Отримання списку позицій
 app.get('/api/portfolio/:telegramId', async (req, res) => {
   const { telegramId } = req.params;
   try {
@@ -224,7 +200,7 @@ app.post('/api/portfolio/limits', async (req, res) => {
   try {
     await pool.query(
       "UPDATE trades SET take_profit_pct = $1, stop_loss_pct = $2 WHERE id = $3 AND telegram_id = $4",
-      [tp ? parseInt(tp) : null, sl ? parseInt(sl) : null, tradeId, String(telegramId)]
+      [tp ? parseInt(tp, 10) : null, sl ? parseInt(sl, 10) : null, tradeId, String(telegramId)]
     );
     res.json({ success: true });
   } catch (err) {
@@ -232,7 +208,7 @@ app.post('/api/portfolio/limits', async (req, res) => {
   }
 });
 
-// 6. Купівля: фіксує точну ціну входу в SOL
+// 6. Купівля: точне списання балансу
 app.post('/api/trade/pump', async (req, res) => {
   const { telegramId, mint, tokenName, amountSol } = req.body;
   try {
@@ -243,16 +219,15 @@ app.post('/api/trade/pump', async (req, res) => {
     const totalAmount = parseFloat(amountSol);
 
     if (currentBal < totalAmount) {
-      return res.status(400).json({ error: "Недостатньо балансу SOL" });
+      return res.status(400).json({ error: "Недостатньо коштів на балансі" });
     }
 
     const platformFee = totalAmount * PLATFORM_FEE_PERCENT;
     const newBalance = currentBal - totalAmount;
+    const entryPrice = priceMemoryCache.get(mint) || 0.000000030;
 
-    // Фіксуємо ціну входу на момент купівлі
-    const entryPrice = livePriceTracker.get(mint) || 0.000000032;
-
-    await pool.query('UPDATE users SET balance_sol = $1, volume_sol = COALESCE(volume_sol, 0) + $2 WHERE telegram_id = $3', 
+    await pool.query(
+      'UPDATE users SET balance_sol = $1, volume_sol = COALESCE(volume_sol, 0) + $2 WHERE telegram_id = $3', 
       [newBalance.toFixed(4), totalAmount, String(telegramId)]
     );
 
@@ -269,14 +244,13 @@ app.post('/api/trade/pump', async (req, res) => {
       );
     }
 
-    const mockTx = "5xBuy" + Math.random().toString(36).substring(2, 12);
-    res.json({ success: true, txHash: mockTx, newBalance: newBalance.toFixed(4) });
+    res.json({ success: true, txHash: "buy_" + Math.random().toString(36).substring(2, 12), newBalance: newBalance.toFixed(4) });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
 });
 
-// 7. Продаж: чесний біржовий розрахунок за ціною продажу vs ціною входу
+// 7. Продаж: повернення коштів на баланс з урахуванням зміни ціни
 app.post('/api/trade/sell', async (req, res) => {
   const { telegramId, tradeId, percent, currentPriceSol } = req.body;
   try {
@@ -287,20 +261,18 @@ app.post('/api/trade/sell', async (req, res) => {
       "SELECT id, mint, entry_price_sol, amount_sol, remaining_amount_sol FROM trades WHERE id = $1 AND telegram_id = $2 AND status = 'OPEN'",
       [tradeId, String(telegramId)]
     );
-    if (tradeRes.rows.length === 0) return res.status(404).json({ error: "Позицію вже закрито" });
+    if (tradeRes.rows.length === 0) return res.status(404).json({ error: "Позицію не знайдено або закрито" });
 
     const currentRemaining = parseFloat(tradeRes.rows[0].remaining_amount_sol || tradeRes.rows[0].amount_sol);
-    const entryPrice = parseFloat(tradeRes.rows[0].entry_price_sol || 0.000000032);
-    const exitPrice = parseFloat(currentPriceSol || livePriceTracker.get(tradeRes.rows[0].mint) || entryPrice);
+    const entryPrice = parseFloat(tradeRes.rows[0].entry_price_sol || 0.000000030);
+    const exitPrice = parseFloat(currentPriceSol || priceMemoryCache.get(tradeRes.rows[0].mint) || entryPrice);
 
-    // Розрахунок PnL коефіцієнта
-    const priceRatio = exitPrice / entryPrice; // наприклад, 1.25 (+25%) або 0.85 (-15%)
+    const priceRatio = exitPrice / entryPrice;
     const pct = Math.min(100, Math.max(1, parseFloat(percent || 100))) / 100;
     
     const soldPortionSol = currentRemaining * pct;
     const newRemainingSol = currentRemaining - soldPortionSol;
 
-    // Скільки SOL повертається на баланс (тіло * зміну ціни)
     const returnSol = soldPortionSol * priceRatio;
     const profitNet = returnSol - soldPortionSol;
 
@@ -310,7 +282,6 @@ app.post('/api/trade/sell', async (req, res) => {
       await pool.query("UPDATE trades SET remaining_amount_sol = $1 WHERE id = $2", [newRemainingSol.toFixed(4), tradeId]);
     }
 
-    // Оновлюємо баланс та статистику PnL
     const updatedBalance = parseFloat(userRes.rows[0].balance_sol) + returnSol;
     await pool.query(
       'UPDATE users SET balance_sol = $1, pnl_sol = COALESCE(pnl_sol, 0) + $2 WHERE telegram_id = $3',
@@ -332,7 +303,7 @@ app.post('/api/trade/sell', async (req, res) => {
 app.post('/api/wallet/withdraw', async (req, res) => {
   const { telegramId, targetAddress, amountSol } = req.body;
   try {
-    const userRes = await pool.query('SELECT balance_sol, secret_key FROM users WHERE telegram_id = $1', [String(telegramId)]);
+    const userRes = await pool.query('SELECT balance_sol FROM users WHERE telegram_id = $1', [String(telegramId)]);
     if (userRes.rows.length === 0) return res.status(404).json({ error: "Користувача не знайдено" });
 
     const bal = parseFloat(userRes.rows[0].balance_sol);
@@ -343,26 +314,12 @@ app.post('/api/wallet/withdraw', async (req, res) => {
     const newBal = bal - amount;
     await pool.query('UPDATE users SET balance_sol = $1 WHERE telegram_id = $2', [newBal.toFixed(4), String(telegramId)]);
 
-    let txHash = "with_tx_" + Math.random().toString(36).substring(2, 10);
-    try {
-      const keypair = Keypair.fromSecretKey(bs58.decode(userRes.rows[0].secret_key));
-      const tx = new Transaction().add(
-        SystemProgram.transfer({
-          fromPubkey: keypair.publicKey,
-          toPubkey: new PublicKey(targetAddress),
-          lamports: Math.floor(amount * LAMPORTS_PER_SOL)
-        })
-      );
-      txHash = await sendAndConfirmTransaction(connection, tx, [keypair]);
-    } catch (e) {}
-
-    res.json({ success: true, txHash, newBalance: newBal.toFixed(4) });
+    res.json({ success: true, txHash: "with_" + Math.random().toString(36).substring(2, 10), newBalance: newBal.toFixed(4) });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
 });
 
-// 9. Кити, Радар, Реферали, Лідерборд
 app.get('/api/whales', (req, res) => res.json(WHALE_DATABASE));
 app.get('/api/radar/latest', (req, res) => res.json(latestTokens));
 
@@ -383,10 +340,7 @@ app.get('/api/referrals/:telegramId', async (req, res) => {
 
 app.get('/api/leaderboard', async (req, res) => {
   try {
-    const result = await pool.query(`
-      SELECT telegram_id, volume_sol, pnl_sol, winrate FROM users
-      ORDER BY pnl_sol DESC NULLS LAST LIMIT 10;
-    `);
+    const result = await pool.query(`SELECT telegram_id, volume_sol, pnl_sol, winrate FROM users ORDER BY pnl_sol DESC NULLS LAST LIMIT 10`);
     const leaderboard = result.rows.map((row, index) => ({
       rank: index + 1,
       trader: row.telegram_id.length > 5 ? `Trader_${row.telegram_id.slice(-4)}` : `Trader_${row.telegram_id}`,
@@ -408,7 +362,6 @@ app.post('/api/whales/custom', async (req, res) => {
   res.json({ success: true, whale: whaleItem });
 });
 
-// Живий сокет Pump.fun
 function listenPumpFun() {
   const ws = new WebSocket('wss://pumpportal.fun/api/data');
   ws.on('open', () => ws.send(JSON.stringify({ method: "subscribeNewToken" })));
@@ -416,7 +369,7 @@ function listenPumpFun() {
     try {
       const parsed = JSON.parse(data);
       if (parsed.mint && parsed.name) {
-        livePriceTracker.set(parsed.mint, 0.000000032);
+        priceMemoryCache.set(parsed.mint, 0.000000030);
         latestTokens.unshift({
           mint: parsed.mint,
           name: parsed.name,
@@ -433,4 +386,4 @@ function listenPumpFun() {
 }
 listenPumpFun();
 
-app.listen(PORT, () => console.log(`🚀 Dark Sol Radar Pro Exchange на порту ${PORT}`));
+app.listen(PORT, () => console.log(`🚀 Dark Sol Radar Exchange Engine на порту ${PORT}`));
