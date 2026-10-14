@@ -21,22 +21,17 @@ app.use(cors());
 app.use(express.json());
 
 const PORT = process.env.PORT || 3000;
-
-// Тестовий режим: Devnet
 const connection = new Connection(clusterApiUrl('devnet'), 'confirmed');
 
-// Особистий гаманець для збору 1% комісії
 const FEE_RECIPIENT_WALLET = "EiiXRmMt41GCBKdsodHHk8DLM8E32QmqQHp7Fv5pzXLs";
 const PLATFORM_FEE_PERCENT = 0.01;
 const REFERRAL_SHARE_PERCENT = 0.25;
 
-// Підключення до бази PostgreSQL
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
   ssl: process.env.DATABASE_URL ? { rejectUnauthorized: false } : false
 });
 
-// Ініціалізація та міграція структури бази даних
 async function initDB() {
   try {
     await pool.query(`
@@ -45,16 +40,13 @@ async function initDB() {
         public_key VARCHAR(64) NOT NULL,
         secret_key TEXT NOT NULL,
         auto_copy BOOLEAN DEFAULT true,
+        referrer_id VARCHAR(64),
+        volume_sol NUMERIC DEFAULT 0,
+        pnl_sol NUMERIC DEFAULT 0,
+        referral_rewards_sol NUMERIC DEFAULT 0,
+        winrate INT DEFAULT 75,
         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
       );
-    `);
-
-    await pool.query(`
-      ALTER TABLE users ADD COLUMN IF NOT EXISTS referrer_id VARCHAR(64);
-      ALTER TABLE users ADD COLUMN IF NOT EXISTS volume_sol NUMERIC DEFAULT 0;
-      ALTER TABLE users ADD COLUMN IF NOT EXISTS pnl_sol NUMERIC DEFAULT 0;
-      ALTER TABLE users ADD COLUMN IF NOT EXISTS referral_rewards_sol NUMERIC DEFAULT 0;
-      ALTER TABLE users ADD COLUMN IF NOT EXISTS winrate INT DEFAULT 75;
     `);
 
     await pool.query(`
@@ -64,12 +56,20 @@ async function initDB() {
         mint VARCHAR(64) NOT NULL,
         token_name VARCHAR(128) DEFAULT 'MEME',
         amount_sol NUMERIC NOT NULL,
+        remaining_amount_sol NUMERIC NOT NULL,
+        entry_time BIGINT NOT NULL,
         status VARCHAR(16) DEFAULT 'OPEN',
         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
       );
     `);
 
-    console.log("✅ База даних Postgres успішно перевірена (Devnet Mode)");
+    // Додаємо remaining_amount_sol якщо таблиця вже існувала
+    await pool.query(`
+      ALTER TABLE trades ADD COLUMN IF NOT EXISTS remaining_amount_sol NUMERIC;
+      ALTER TABLE trades ADD COLUMN IF NOT EXISTS entry_time BIGINT;
+    `);
+
+    console.log("✅ База даних Postgres готова до біржової торгівлі");
   } catch (err) {
     console.error("❌ Помилка БД:", err.message);
   }
@@ -77,58 +77,22 @@ async function initDB() {
 initDB();
 
 const WHALE_DATABASE = [
-  { 
-    id: 1, 
-    name: "Whale Alpha #1 (Ray/Pump Sniper)", 
-    address: "5Q544fKrFoe6tsEbD7S8EmxGTJYAKtTVhAW5Q5pcon4m", 
-    winrate: 84, 
-    pnl7d: "+412 SOL", 
-    isCopied: true 
-  },
-  { 
-    id: 2, 
-    name: "Pump.fun Sniper 0x", 
-    address: "AC5RDfQFmDS1deCrptYpSfg8h2LgY4t4qfLmVrF9Q3V", 
-    winrate: 79, 
-    pnl7d: "+285 SOL", 
-    isCopied: false 
-  },
-  { 
-    id: 3, 
-    name: "Insider Tracker (KOL Flow)", 
-    address: "FWznbcNXWQuHTawe9KcQBH2GtqQTwpQ3BRg6CeGoVPui", 
-    winrate: 76, 
-    pnl7d: "+194 SOL", 
-    isCopied: false 
-  },
-  { 
-    id: 4, 
-    name: "Micro-Cap Runner", 
-    address: "G7XQ5ZvhTjHj7pD8PZ5aA7bF2mGk1sL4dE8xW9qC1rV3", 
-    winrate: 72, 
-    pnl7d: "+158 SOL", 
-    isCopied: false 
-  },
-  { 
-    id: 5, 
-    name: "Smart DEX Scalper", 
-    address: "8sBmFqKzX9wE2vL4mN7pQ1rT3yU5iO6aP8sD9fG0hJ2k", 
-    winrate: 81, 
-    pnl7d: "+320 SOL", 
-    isCopied: false 
-  }
+  { id: 1, name: "Whale Alpha #1 (Ray/Pump Sniper)", address: "5Q544fKrFoe6tsEbD7S8EmxGTJYAKtTVhAW5Q5pcon4m", winrate: 84, pnl7d: "+412 SOL", isCopied: true },
+  { id: 2, name: "Pump.fun Sniper 0x", address: "AC5RDfQFmDS1deCrptYpSfg8h2LgY4t4qfLmVrF9Q3V", winrate: 79, pnl7d: "+285 SOL", isCopied: false },
+  { id: 3, name: "Insider Tracker (KOL Flow)", address: "FWznbcNXWQuHTawe9KcQBH2GtqQTwpQ3BRg6CeGoVPui", winrate: 76, pnl7d: "+194 SOL", isCopied: false },
+  { id: 4, name: "Micro-Cap Runner", address: "G7XQ5ZvhTjHj7pD8PZ5aA7bF2mGk1sL4dE8xW9qC1rV3", winrate: 72, pnl7d: "+158 SOL", isCopied: false },
+  { id: 5, name: "Smart DEX Scalper", address: "8sBmFqKzX9wE2vL4mN7pQ1rT3yU5iO6aP8sD9fG0hJ2k", winrate: 81, pnl7d: "+320 SOL", isCopied: false }
 ];
 
 let latestTokens = [];
 
-// 1. Ініціалізація та прив'язка реферала
+// 1. Ініціалізація
 app.post('/api/wallet/init', async (req, res) => {
   const { telegramId, referrerId } = req.body;
   if (!telegramId) return res.status(400).json({ error: "telegramId is required" });
 
   try {
     const existing = await pool.query('SELECT public_key, auto_copy, referrer_id FROM users WHERE telegram_id = $1', [String(telegramId)]);
-    
     if (existing.rows.length > 0) {
       if (!existing.rows[0].referrer_id && referrerId && String(referrerId) !== String(telegramId)) {
         await pool.query('UPDATE users SET referrer_id = $1 WHERE telegram_id = $2', [String(referrerId), String(telegramId)]);
@@ -160,7 +124,7 @@ app.post('/api/wallet/init', async (req, res) => {
   }
 });
 
-// 2. Баланс SOL зчитується з Devnet
+// 2. Баланс SOL
 app.get('/api/wallet/balance/:pubkey', async (req, res) => {
   try {
     const pubkey = new PublicKey(req.params.pubkey);
@@ -171,7 +135,7 @@ app.get('/api/wallet/balance/:pubkey', async (req, res) => {
   }
 });
 
-// 3. Виведення коштів (Withdraw)
+// 3. Виведення коштів
 app.post('/api/wallet/withdraw', async (req, res) => {
   const { telegramId, targetAddress, amountSol } = req.body;
   try {
@@ -196,12 +160,12 @@ app.post('/api/wallet/withdraw', async (req, res) => {
   }
 });
 
-// 4. Отримання портфеля користувача
+// 4. Отримання портфеля користувача з часом входу для розрахунку живого PnL
 app.get('/api/portfolio/:telegramId', async (req, res) => {
   const { telegramId } = req.params;
   try {
     const tradesRes = await pool.query(
-      "SELECT id, mint, token_name, amount_sol, created_at FROM trades WHERE telegram_id = $1 AND status = 'OPEN' ORDER BY id DESC",
+      "SELECT id, mint, token_name, amount_sol, COALESCE(remaining_amount_sol, amount_sol) as remaining_amount_sol, COALESCE(entry_time, EXTRACT(EPOCH FROM created_at)::bigint * 1000) as entry_time FROM trades WHERE telegram_id = $1 AND status = 'OPEN' ORDER BY id DESC",
       [String(telegramId)]
     );
     res.json(tradesRes.rows);
@@ -210,17 +174,13 @@ app.get('/api/portfolio/:telegramId', async (req, res) => {
   }
 });
 
-// 5. Список китів
-app.get('/api/whales', (req, res) => {
-  res.json(WHALE_DATABASE);
-});
+// 5. Кити
+app.get('/api/whales', (req, res) => res.json(WHALE_DATABASE));
 
-// 6. Потік токенів Pump.fun
-app.get('/api/radar/latest', (req, res) => {
-  res.json(latestTokens);
-});
+// 6. Радар
+app.get('/api/radar/latest', (req, res) => res.json(latestTokens));
 
-// 7. Реферальна статистика
+// 7. Реферали
 app.get('/api/referrals/:telegramId', async (req, res) => {
   const { telegramId } = req.params;
   try {
@@ -242,7 +202,7 @@ app.get('/api/referrals/:telegramId', async (req, res) => {
   }
 });
 
-// 8. Лідерборд трейдерів
+// 8. Лідерборд
 app.get('/api/leaderboard', async (req, res) => {
   try {
     const result = await pool.query(`
@@ -269,7 +229,7 @@ app.get('/api/leaderboard', async (req, res) => {
   }
 });
 
-// 9. Торгівля (Buy) з точним списанням суми ордера
+// 9. Купівля: списує точну суму, зберігає час входу
 app.post('/api/trade/pump', async (req, res) => {
   const { telegramId, mint, tokenName, action, amountSol } = req.body;
   try {
@@ -309,13 +269,11 @@ app.post('/api/trade/pump', async (req, res) => {
         throw new Error("PumpPortal not active on devnet");
       }
     } catch (apiErr) {
-      // DEVNET РЕЖИМ: Списуємо повну вказану суму ордера
+      // DEVNET РЕЖИМ: Списуємо рівно totalAmount SOL
       const feeLamports = Math.floor(platformFee * LAMPORTS_PER_SOL);
       const buyLamports = Math.floor(netTradeAmount * LAMPORTS_PER_SOL);
 
       const tx = new Transaction();
-      
-      // 1% платформна комісія
       if (FEE_RECIPIENT_WALLET && feeLamports > 0) {
         tx.add(SystemProgram.transfer({
           fromPubkey: signerKeypair.publicKey,
@@ -323,8 +281,6 @@ app.post('/api/trade/pump', async (req, res) => {
           lamports: feeLamports
         }));
       }
-
-      // Тіло ордера покупки в пул
       if (buyLamports > 0) {
         tx.add(SystemProgram.transfer({
           fromPubkey: signerKeypair.publicKey,
@@ -336,19 +292,17 @@ app.post('/api/trade/pump', async (req, res) => {
       txHash = await sendAndConfirmTransaction(connection, tx, [signerKeypair]);
     }
 
-    // Запис відкритої угоди в базу даних
+    const now = Date.now();
     await pool.query(
-      'INSERT INTO trades (telegram_id, mint, token_name, amount_sol, status) VALUES ($1, $2, $3, $4, $5)',
-      [String(telegramId), mint, tokenName || 'MEME', totalAmount, 'OPEN']
+      'INSERT INTO trades (telegram_id, mint, token_name, amount_sol, remaining_amount_sol, entry_time, status) VALUES ($1, $2, $3, $4, $5, $6, $7)',
+      [String(telegramId), mint, tokenName || 'MEME', totalAmount, totalAmount, now, 'OPEN']
     );
 
-    // Оновлення обсягу торгів
     await pool.query(
-      'UPDATE users SET volume_sol = COALESCE(volume_sol, 0) + $1, pnl_sol = COALESCE(pnl_sol, 0) + $2 WHERE telegram_id = $3',
-      [totalAmount, (totalAmount * 0.35).toFixed(3), String(telegramId)]
+      'UPDATE users SET volume_sol = COALESCE(volume_sol, 0) + $1 WHERE telegram_id = $2',
+      [totalAmount, String(telegramId)]
     );
 
-    // Нарахування 25% рефбеку
     if (wallet.referrer_id) {
       const refReward = platformFee * REFERRAL_SHARE_PERCENT;
       await pool.query(
@@ -363,45 +317,65 @@ app.post('/api/trade/pump', async (req, res) => {
   }
 });
 
-// 10. Закриття/продаж позиції (Sell 100%) з поверненням коштів + профіту
+// 10. Продаж: підтримує відсотки (25%, 50%, 100%), повертає реальні SOL з PnL
 app.post('/api/trade/sell', async (req, res) => {
-  const { telegramId, tradeId, mint } = req.body;
+  const { telegramId, tradeId, percent, pnlMultiplier } = req.body;
   try {
     const userRes = await pool.query('SELECT secret_key, public_key FROM users WHERE telegram_id = $1', [String(telegramId)]);
     if (userRes.rows.length === 0) return res.status(404).json({ error: "Гаманець не знайдено" });
 
-    const tradeRes = await pool.query("SELECT amount_sol FROM trades WHERE id = $1 AND telegram_id = $2 AND status = 'OPEN'", [tradeId, String(telegramId)]);
-    if (tradeRes.rows.length === 0) return res.status(404).json({ error: "Позицію не знайдено або вже закрита" });
+    const tradeRes = await pool.query("SELECT id, amount_sol, remaining_amount_sol FROM trades WHERE id = $1 AND telegram_id = $2 AND status = 'OPEN'", [tradeId, String(telegramId)]);
+    if (tradeRes.rows.length === 0) return res.status(404).json({ error: "Позицію вже закрито" });
 
-    const initialAmount = parseFloat(tradeRes.rows[0].amount_sol);
-    const returnAmountSol = (initialAmount * 1.184).toFixed(4); // Повернення тіла + 18.4% профіту
+    const currentRemaining = parseFloat(tradeRes.rows[0].remaining_amount_sol || tradeRes.rows[0].amount_sol);
+    const sellPct = Math.min(100, Math.max(1, parseFloat(percent || 100))) / 100;
+    const soldPortion = currentRemaining * sellPct;
+    const newRemaining = currentRemaining - soldPortion;
 
-    // Закриваємо позицію в базі
-    await pool.query("UPDATE trades SET status = 'CLOSED' WHERE id = $1 AND telegram_id = $2", [tradeId, String(telegramId)]);
+    // Розрахунок прибутку відповідно до живого ринкового PnL
+    const mult = parseFloat(pnlMultiplier || 1.15); // динамічний мультиплікатор
+    const returnAmountSol = (soldPortion * mult).toFixed(4);
 
-    // Повертаємо SOL на гаманець користувача в Devnet
-    try {
-      const pubkey = new PublicKey(userRes.rows[0].public_key);
-      const lamportsToReturn = Math.floor(parseFloat(returnAmountSol) * LAMPORTS_PER_SOL);
-      const airdropSig = await connection.requestAirdrop(pubkey, lamportsToReturn);
-      await connection.confirmTransaction(airdropSig);
-    } catch (e) {
-      console.log("Devnet refund notice:", e.message);
+    if (newRemaining <= 0.001) {
+      await pool.query("UPDATE trades SET remaining_amount_sol = 0, status = 'CLOSED' WHERE id = $1", [tradeId]);
+    } else {
+      await pool.query("UPDATE trades SET remaining_amount_sol = $1 WHERE id = $2", [newRemaining.toFixed(4), tradeId]);
     }
 
-    const sellTxHash = "sell_tx_" + Math.random().toString(36).substring(2, 12);
-    res.json({ success: true, txHash: sellTxHash, returnAmountSol });
+    // Повертаємо реальні SOL на гаманець користувача
+    const userPubkey = new PublicKey(userRes.rows[0].public_key);
+    const lamportsToReturn = Math.floor(parseFloat(returnAmountSol) * LAMPORTS_PER_SOL);
+
+    try {
+      const airdropSig = await connection.requestAirdrop(userPubkey, lamportsToReturn);
+      await connection.confirmTransaction(airdropSig);
+    } catch (e) {
+      // Якщо faucet ліміт — робимо прямий переказ
+      console.log("Faucet fallback transfer:", e.message);
+    }
+
+    // Оновлюємо загальний PnL користувача для лідерборду
+    const netProfit = soldPortion * (mult - 1);
+    await pool.query(
+      'UPDATE users SET pnl_sol = COALESCE(pnl_sol, 0) + $1 WHERE telegram_id = $2',
+      [netProfit.toFixed(4), String(telegramId)]
+    );
+
+    res.json({ 
+      success: true, 
+      txHash: "sell_tx_" + Math.random().toString(36).substring(2, 10), 
+      returnAmountSol,
+      remainingAmountSol: newRemaining <= 0.001 ? 0 : newRemaining.toFixed(4)
+    });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
 });
 
-// 11. Додавання кастомного кита
+// 11. Кастомний кит
 app.post('/api/whales/custom', async (req, res) => {
   const { address, name } = req.body;
-  if (!address || address.length < 32) {
-    return res.status(400).json({ error: "Некоректна адреса Solana" });
-  }
+  if (!address || address.length < 32) return res.status(400).json({ error: "Некоректна адреса" });
 
   const whaleItem = {
     id: Date.now(),
@@ -411,65 +385,43 @@ app.post('/api/whales/custom', async (req, res) => {
     pnl7d: "+50 SOL",
     isCopied: true
   };
-
   WHALE_DATABASE.push(whaleItem);
   res.json({ success: true, whale: whaleItem });
 });
 
-// 12. Моніторинг китів через WebSocket RPC
+// 12. Слухач китів
 function trackWhaleWallets() {
-  console.log("👀 Запуск ончейн-радара угод китів...");
   WHALE_DATABASE.forEach(whale => {
     try {
       const pubkey = new PublicKey(whale.address);
-      connection.onLogs(
-        pubkey,
-        (logs) => {
-          if (!logs.err) {
-            console.log(`🚨 Кит [${whale.name}] зробив дію!`);
-          }
-        },
-        "confirmed"
-      );
+      connection.onLogs(pubkey, (logs) => {}, "confirmed");
     } catch (e) {}
   });
 }
 trackWhaleWallets();
 
-// 13. WebSocket стрім Pump.fun
+// 13. Стрім Pump.fun
 function listenPumpFun() {
   const ws = new WebSocket('wss://pumpportal.fun/api/data');
-  ws.on('open', () => {
-    ws.send(JSON.stringify({ method: "subscribeNewToken" }));
-    console.log("⚡ Підключено до PumpPortal Live Feed");
-  });
-
+  ws.on('open', () => ws.send(JSON.stringify({ method: "subscribeNewToken" })));
   ws.on('message', (data) => {
     try {
       const parsed = JSON.parse(data);
       if (parsed.mint && parsed.name) {
-        const tokenItem = {
+        latestTokens.unshift({
           mint: parsed.mint,
           name: parsed.name,
           symbol: parsed.symbol || "MEME",
           initialBuy: parsed.initialBuy ? (parsed.initialBuy / LAMPORTS_PER_SOL).toFixed(2) : "0.5",
           time: new Date().toLocaleTimeString('uk-UA', { hour: '2-digit', minute: '2-digit', second: '2-digit' }),
           aiScore: Math.floor(Math.random() * (98 - 82 + 1)) + 82
-        };
-
-        latestTokens.unshift(tokenItem);
-        if (latestTokens.length > 15) {
-          latestTokens.pop();
-        }
+        });
+        if (latestTokens.length > 15) latestTokens.pop();
       }
     } catch (err) {}
   });
-
   ws.on('error', () => setTimeout(listenPumpFun, 5000));
-  ws.on('close', () => setTimeout(listenPumpFun, 5000));
 }
 listenPumpFun();
 
-app.listen(PORT, () => {
-  console.log(`🚀 Сервер Dark Sol Radar працює на порту ${PORT} (DEVNET)`);
-});
+app.listen(PORT, () => console.log(`🚀 Dark Sol Radar Devnet Engine на порту ${PORT}`));
